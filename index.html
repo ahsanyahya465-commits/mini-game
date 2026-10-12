@@ -1,0 +1,398 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Indoor Number Arena</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;overflow:hidden;background:#101625;color:#fff;font-family:system-ui,Arial}
+#game{position:fixed;inset:0}
+canvas{display:block}
+#hud{position:fixed;top:14px;left:14px;right:14px;display:flex;gap:10px;justify-content:space-between;align-items:flex-start;pointer-events:none}
+.card{background:#10192be8;border:1px solid #435473;border-radius:13px;padding:10px 14px;box-shadow:0 6px 22px #0005}
+.card small{display:block;color:#9db2d4;font-size:11px}
+.card strong{font-size:22px;color:#5af4e5}
+#status{font-size:12px;color:#5af4e5}
+#leader{position:fixed;right:14px;top:90px;width:185px;pointer-events:none}
+#leader h3{font-size:12px;color:#5af4e5;margin:0 0 8px}
+.rank{font-size:12px;display:flex;justify-content:space-between;padding:5px 0;gap:8px}
+#help{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#10192be8;border:1px solid #435473;border-radius:12px;padding:10px 15px;font-size:12px;color:#cfdbf3;white-space:nowrap}
+#overlay{position:fixed;inset:0;background:#07101dcc;display:flex;align-items:center;justify-content:center;padding:20px}
+.panel{width:min(400px,100%);background:#121d33;border:1px solid #465b83;border-radius:20px;padding:25px;text-align:center;box-shadow:0 20px 80px #0008}
+h1{font-size:26px;margin:0 0 8px}h1 span{color:#5af4e5}
+p{color:#aabbd8;font-size:14px;line-height:1.6}
+input{width:100%;padding:12px;background:#091120;border:1px solid #465b83;border-radius:10px;color:white;margin:8px 0 12px}
+button{border:0;border-radius:11px;padding:12px 18px;font-weight:800;background:linear-gradient(110deg,#5af4e5,#8b9dff);color:#101625;cursor:pointer}
+#mobile{position:fixed;bottom:75px;left:12px;display:none;gap:7px}
+#mobile button{padding:13px;background:#111d33e8;border:1px solid #53678e;color:white}
+@media(max-width:600px){#leader{width:130px;top:105px}#hud{gap:5px}.card{padding:8px}.card strong{font-size:18px}#mobile{display:flex}#help{bottom:12px;font-size:10px}}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<div id="game"></div>
+
+<div id="hud">
+  <div class="card"><small>YOUR NUMBER</small><strong id="num">2</strong></div>
+  <div class="card"><small>SCORE</small><strong id="score">0</strong></div>
+  <div class="card"><small>SERVER</small><div id="status">Connecting...</div></div>
+</div>
+
+<div id="leader" class="card">
+  <h3>🏆 ARENA LEADERS</h3>
+  <div id="ranks">Connecting players...</div>
+</div>
+
+<div id="help">WASD / Arrow keys: Move · Mouse: Look around · Collect matching gates · 2× doubles your number</div>
+
+<div id="mobile">
+  <button id="left">◀</button><button id="forward">▲</button>
+  <button id="back">▼</button><button id="right">▶</button>
+</div>
+
+<div id="overlay">
+  <div class="panel">
+    <h1>INDOOR <span>NUMBER ARENA</span></h1>
+    <p>Explore the 3D arena. Collect matching numbers to grow, grab 2× power-ups and defeat smaller players!</p>
+    <input id="name" maxlength="16" placeholder="Your player name">
+    <button id="play">ENTER ARENA</button>
+    <p>For multiplayer, open this game in two browser tabs or share your deployed server URL.</p>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+(() => {
+  const socket = io();
+  const root = document.getElementById("game");
+  const statusEl = document.getElementById("status");
+  const numberEl = document.getElementById("num");
+  const scoreEl = document.getElementById("score");
+  const ranksEl = document.getElementById("ranks");
+
+  let myId = null, joined = false, state = {players:[],pickups:[]};
+  let lastSent = 0, cameraAngle = 0, pointerDown = false, lastPointerX = 0;
+  const keys = new Set();
+  const playerMeshes = new Map();
+  const pickupMeshes = new Map();
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x111b30);
+  scene.fog = new THREE.Fog(0x111b30, 25, 65);
+
+  const camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 150);
+  camera.position.set(0, 8, 12);
+
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setSize(innerWidth,innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  root.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xc8e6ff,0x343247,2.0));
+  const mainLight = new THREE.DirectionalLight(0xffffff,2.2);
+  mainLight.position.set(-10,20,8);
+  mainLight.castShadow = true;
+  mainLight.shadow.mapSize.set(1024,1024);
+  scene.add(mainLight);
+
+  // Bright indoor tiled floor
+  const floorMat = new THREE.MeshStandardMaterial({color:0x303c52,roughness:.68,metalness:.12});
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(36,36),floorMat);
+  floor.rotation.x=-Math.PI/2;
+  floor.receiveShadow=true;
+  scene.add(floor);
+
+  const grid = new THREE.GridHelper(36,36,0x63eadd,0x52647d);
+  grid.position.y=.015;
+  scene.add(grid);
+
+  function box(w,h,d,x,y,z,color,roughness=.65){
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(w,h,d),
+      new THREE.MeshStandardMaterial({color,roughness,metalness:.08})
+    );
+    mesh.position.set(x,y,z);
+    mesh.castShadow=true;mesh.receiveShadow=true;scene.add(mesh);
+    return mesh;
+  }
+
+  // Indoor walls and architectural trim
+  box(36,6,.6,0,3,-18,0x29374e);
+  box(36,6,.6,0,3,18,0x29374e);
+  box(.6,6,36,-18,3,0,0x29374e);
+  box(.6,6,36,18,3,0,0x29374e);
+  box(36,.25,.3,0,5.8,-17.6,0x55e9dd);
+  box(36,.25,.3,0,5.8,17.6,0x55e9dd);
+  box(.3,.25,36,-17.6,5.8,0,0x55e9dd);
+  box(.3,.25,36,17.6,5.8,0,0x55e9dd);
+
+  // Pillars
+  for(const x of [-12,-6,6,12]){
+    for(const z of [-12,0,12]){
+      box(.65,4.8,.65,x,2.4,z,0x53627a);
+      box(.85,.18,.85,x,4.85,z,0x5af4e5);
+      box(.8,.15,.8,x,.12,z,0x7b8ca5);
+    }
+  }
+
+  // Ceiling beams and bright lamps
+  for(const z of [-12,-4,4,12]){
+    box(32,.22,.35,0,5.65,z,0x65768e);
+    const lamp = new THREE.Mesh(
+      new THREE.BoxGeometry(3,.12,.6),
+      new THREE.MeshBasicMaterial({color:0xe3ffff})
+    );
+    lamp.position.set(0,5.45,z);
+    scene.add(lamp);
+    const light = new THREE.PointLight(0xc7faff,35,14,2);
+    light.position.set(0,5.1,z);
+    scene.add(light);
+  }
+
+  // Arena decorations
+  for(const z of [-8,8]){
+    box(4,2,.2,0,1,z,0x182945);
+    box(3.7,.08,.25,0,2,z,0x9c77ff);
+  }
+
+  function makeLabel(text){
+    const canvas=document.createElement("canvas");
+    canvas.width=512;canvas.height=128;
+    const c=canvas.getContext("2d");
+    c.fillStyle="rgba(7,15,31,.85)";
+    c.beginPath();c.roundRect(8,8,496,112,24);c.fill();
+    c.strokeStyle="#5af4e5";c.lineWidth=5;c.stroke();
+    c.fillStyle="#ffffff";c.font="bold 48px Arial";
+    c.textAlign="center";c.textBaseline="middle";c.fillText(text,256,64);
+    const tex=new THREE.CanvasTexture(canvas);
+    tex.colorSpace=THREE.SRGBColorSpace;
+    const sprite=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,depthTest:false}));
+    sprite.scale.set(2.7,.68,1);
+    sprite.userData.canvas=canvas;
+    sprite.userData.texture=tex;
+    return sprite;
+  }
+
+  function updateLabel(sprite,text){
+    const c=sprite.userData.canvas;
+    const ctx=c.getContext("2d");
+    ctx.clearRect(0,0,c.width,c.height);
+    ctx.fillStyle="rgba(7,15,31,.88)";
+    ctx.beginPath();ctx.roundRect(8,8,496,112,24);ctx.fill();
+    ctx.strokeStyle="#5af4e5";ctx.lineWidth=5;ctx.stroke();
+    ctx.fillStyle="#fff";ctx.font="bold 48px Arial";
+    ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(text,256,64);
+    sprite.userData.texture.needsUpdate=true;
+  }
+
+  function createPlayer(id){
+    const group=new THREE.Group();
+    const material=new THREE.MeshStandardMaterial({
+      color:id===myId?0x42eadd:0x9a75ff,
+      emissive:id===myId?0x075f59:0x24104b,
+      roughness:.25,metalness:.2
+    });
+    const body=new THREE.Mesh(new THREE.BoxGeometry(1,1.25,1),material);
+    body.position.y=.75;body.castShadow=true;group.add(body);
+
+    const top=new THREE.Mesh(
+      new THREE.BoxGeometry(.78,.12,.78),
+      new THREE.MeshStandardMaterial({color:0xffffff,emissive:0x334455})
+    );
+    top.position.y=1.4;group.add(top);
+
+    const label=makeLabel("Player · 2");
+    label.position.y=2.3;group.add(label);
+
+    const ring=new THREE.Mesh(
+      new THREE.TorusGeometry(.8,.045,8,36),
+      new THREE.MeshBasicMaterial({color:id===myId?0x5af4e5:0x9a75ff})
+    );
+    ring.rotation.x=Math.PI/2;ring.position.y=.08;group.add(ring);
+
+    scene.add(group);
+    return {group,body,label,ring};
+  }
+
+  function createPickup(item){
+    const group=new THREE.Group();
+    const isDouble=item.type==="double";
+    const color=isDouble?0xd777ff:0x52f5df;
+    const gem=new THREE.Mesh(
+      new THREE.OctahedronGeometry(.62),
+      new THREE.MeshStandardMaterial({color,emissive:color,emissiveIntensity:.65,metalness:.3,roughness:.2})
+    );
+    gem.castShadow=true;group.add(gem);
+    const label=makeLabel(isDouble?"2×":"+"+item.value);
+    label.scale.set(1.8,.45,1);label.position.y=1.05;group.add(label);
+    const ring=new THREE.Mesh(
+      new THREE.TorusGeometry(.85,.045,8,32),
+      new THREE.MeshBasicMaterial({color})
+    );
+    ring.rotation.x=Math.PI/2;group.add(ring);
+    group.position.set(item.x,.85,item.z);
+    scene.add(group);
+    return {group,gem,ring};
+  }
+
+  socket.on("connect",()=>{
+    myId=socket.id;
+    statusEl.textContent="ONLINE";
+  });
+  socket.on("disconnect",()=>statusEl.textContent="RECONNECTING");
+  socket.on("welcome",data=>{myId=data.id;});
+
+  socket.on("state",newState=>{
+    state=newState;
+    const me=state.players.find(p=>p.id===myId);
+    if(me){
+      numberEl.textContent=me.number.toLocaleString();
+      scoreEl.textContent=me.score.toLocaleString();
+    }
+
+    const activeIds=new Set();
+    for(const p of state.players){
+      if(!p.alive)continue;
+      activeIds.add(p.id);
+      if(!playerMeshes.has(p.id))playerMeshes.set(p.id,createPlayer(p.id));
+      const m=playerMeshes.get(p.id);
+      m.group.position.set(p.x,0,p.z);
+      m.group.rotation.y=p.angle;
+      m.body.material.color.set(p.id===myId?0x42eadd:(p.number>(me?.number||2)?0xff637e:0x9a75ff));
+      m.ring.material.color.set(p.invulnerable?0xffdc72:(p.id===myId?0x5af4e5:0x9a75ff));
+      updateLabel(m.label,p.name+" · "+p.number);
+      m.label.material.opacity=1;
+    }
+    for(const [id,m] of playerMeshes){
+      if(!activeIds.has(id)){scene.remove(m.group);playerMeshes.delete(id);}
+    }
+
+    const itemIds=new Set();
+    for(const item of state.pickups){
+      itemIds.add(item.id);
+      if(!pickupMeshes.has(item.id))pickupMeshes.set(item.id,createPickup(item));
+      const m=pickupMeshes.get(item.id);
+      m.group.position.set(item.x,.85,item.z);
+    }
+    for(const [id,m] of pickupMeshes){
+      if(!itemIds.has(id)){scene.remove(m.group);pickupMeshes.delete(id);}
+    }
+
+    const sorted=[...state.players].sort((a,b)=>b.number-a.number).slice(0,6);
+    ranksEl.innerHTML=sorted.map((p,i)=>
+      `<div class="rank"><span>${i+1}. ${safe(p.name)}${p.id===myId?" ★":""}</span><b>${p.number}</b></div>`
+    ).join("");
+  });
+
+  function safe(s){
+    return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  }
+
+  document.getElementById("play").onclick=()=>{
+    socket.emit("name",document.getElementById("name").value.trim()||"Runner");
+    joined=true;
+    document.getElementById("overlay").classList.add("hidden");
+  };
+
+  addEventListener("keydown",e=>{
+    const k=e.key.toLowerCase();
+    if(["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"].includes(k))e.preventDefault();
+    keys.add(k);
+  });
+  addEventListener("keyup",e=>keys.delete(e.key.toLowerCase()));
+  addEventListener("blur",()=>keys.clear());
+
+  // Drag mouse to rotate the follow camera.
+  renderer.domElement.addEventListener("pointerdown",e=>{
+    pointerDown=true;lastPointerX=e.clientX;
+    renderer.domElement.setPointerCapture(e.pointerId);
+  });
+  renderer.domElement.addEventListener("pointermove",e=>{
+    if(pointerDown){
+      cameraAngle-=(e.clientX-lastPointerX)*.006;
+      lastPointerX=e.clientX;
+    }
+  });
+  renderer.domElement.addEventListener("pointerup",()=>pointerDown=false);
+  renderer.domElement.addEventListener("pointercancel",()=>pointerDown=false);
+
+  // Mobile buttons send movement directions.
+  const mobileKeys={left:"a",right:"d",forward:"w",back:"s"};
+  for(const [id,key] of Object.entries(mobileKeys)){
+    const el=document.getElementById(id);
+    const down=e=>{e.preventDefault();keys.add(key);};
+    const up=e=>{e.preventDefault();keys.delete(key);};
+    el.addEventListener("pointerdown",down);
+    el.addEventListener("pointerup",up);
+    el.addEventListener("pointerleave",up);
+    el.addEventListener("pointercancel",up);
+  }
+
+  let lastFrame=performance.now();
+  function animate(now){
+    requestAnimationFrame(animate);
+    const dt=Math.min((now-lastFrame)/1000,.04);
+    lastFrame=now;
+
+    for(const m of playerMeshes.values()){
+      m.body.position.y=.75+Math.sin(now*.004)*.035;
+      m.ring.rotation.z=now*.0007;
+    }
+    for(const m of pickupMeshes.values()){
+      m.gem.rotation.y+=dt*1.5;
+      m.gem.rotation.x+=dt*.6;
+      m.group.position.y=.85+Math.sin(now*.003)*.12;
+      m.ring.rotation.z-=dt*.7;
+    }
+
+    const me=state.players.find(p=>p.id===myId);
+    if(joined&&me&&me.alive){
+      // Movement follows the camera's horizontal direction.
+      let forward=0,side=0;
+      if(keys.has("w")||keys.has("arrowup"))forward+=1;
+      if(keys.has("s")||keys.has("arrowdown"))forward-=1;
+      if(keys.has("d")||keys.has("arrowright"))side+=1;
+      if(keys.has("a")||keys.has("arrowleft"))side-=1;
+
+      const sin=Math.sin(cameraAngle),cos=Math.cos(cameraAngle);
+      let dx=side*cos+forward*sin;
+      let dz=side*sin-forward*cos;
+      const len=Math.hypot(dx,dz);
+      if(len>0){dx/=len;dz/=len;}
+
+      if(now-lastSent>45){
+        socket.emit("move",{x:dx,z:dz,angle:cameraAngle});
+        lastSent=now;
+      }
+
+      const target=new THREE.Vector3(
+        me.x+Math.sin(cameraAngle)*10,
+        7.5,
+        me.z+Math.cos(cameraAngle)*10
+      );
+      camera.position.lerp(target,.09);
+      camera.lookAt(me.x,1,me.z);
+    }else{
+      camera.position.lerp(new THREE.Vector3(0,13,19),.025);
+      camera.lookAt(0,0,0);
+    }
+
+    renderer.render(scene,camera);
+  }
+  requestAnimationFrame(animate);
+
+  addEventListener("resize",()=>{
+    camera.aspect=innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth,innerHeight);
+  });
+})();
+</script>
+</body>
+</html>
